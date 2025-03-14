@@ -13,7 +13,6 @@ import com.microsoft.azure.functions.*;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -85,13 +84,20 @@ public class Function {
             @DurableOrchestrationTrigger(name = "ctx") TaskOrchestrationContext ctx) {
 
         String fileName = ctx.getInput(String.class);
+
+        //we don't want the activity to return each item in the file as it's too much state. The files are huge.
+        //Instead, let's count the number of rows, then start splitting the file into smaller processing units.
         int expectedCount = ctx.callActivity("countItemsInFile", fileName, int.class).await();
 
+        //First split operation is given the entirity of the file
         FileSplitInput input = new FileSplitInput();
         input.setIndexStart(0);
         input.setIndexEnd(expectedCount);
         int processedCount = ctx.callSubOrchestrator("SplitAndProcess", input, int.class).await();
+
+        //Reconciliation logic. Did we process as much as we expected?
         return expectedCount == processedCount;
+
     }
 
 
@@ -105,6 +111,8 @@ public class Function {
 
         //count the items using jackson to avoid loading a huge byte array
         AtomicInteger count = new AtomicInteger();
+
+        //Stream the JSON so we don't pull it all into memory.
         streamJsonFile()
                 .subscribe(
                         item -> count.getAndIncrement(),
@@ -122,6 +130,8 @@ public class Function {
         int itemsInBatch = fileSplitInput.getIndexEnd() - fileSplitInput.getIndexStart();
 
         List<Task<Integer>> batches = new ArrayList<>();
+
+        //Check if we have got to a small amount of items. If so, process them as a sub-orchestration
         if (itemsInBatch < 25) {
             MiniBatchInput input = new MiniBatchInput();
             input.setBatchStart(fileSplitInput.getIndexStart());
@@ -129,7 +139,8 @@ public class Function {
             batches.add(ctx.callSubOrchestrator("ProcessMiniBatch", input, int.class));
         } else {
 
-            //split the batch in half
+            //Split the batch in half, and call the SplitAndProcess function again. This is a sub-orchestration so each orchestration will only end up tracking 2 sub-orchestrations.
+            //Again this will reduce the state passed around in a single Orchestrator
             int batchMidway = Math.round((float)itemsInBatch / 2);
             FileSplitInput input1 = new FileSplitInput();
             input1.setIndexStart(fileSplitInput.getIndexStart());
@@ -185,9 +196,11 @@ public class Function {
         var batchInformation = ctx.getInput(MiniBatchInput.class);
         List<Task<Boolean>> processAll = new ArrayList<>();
 
+        //Mini batches are only 20 or so items. So lets just get all the items, and process them.
         BatchItem[] items = ctx.callActivity("GetMiniBatchItems", batchInformation, BatchItem[].class).await();
 
         for (BatchItem item : items) {
+            //Could be an activity but in-case the processing is complex, lets use a sub-orchestration
             processAll.add(ctx.callSubOrchestrator("ProcessItemOrchestration", item, Boolean.class));
         }
 
@@ -203,6 +216,8 @@ public class Function {
 
         List<BatchItem> items = new ArrayList<>();
         AtomicInteger count = new AtomicInteger();
+        //This is a little bit wasteful as we read through the file in storage quite a bit. Another approach would be to constantly split the file into smaller new files
+        //as we do the initial chunking. That would be costlier up-front, but more efficient when we attempt to pull out batch items.
         streamJsonFile()
                 .subscribe(
                         item -> {
@@ -233,6 +248,7 @@ public class Function {
                 .connectionString(System.getenv("AzureWebJobsStorage"))
                 .buildClient();
 
+        //Just an example activity - adds a new file to storage with the contens of the mini batch item.
         BlobContainerClient blobContainerClient = blobServiceClient.getBlobContainerClient("output-files");
         blobContainerClient.createIfNotExists();
         BlobClient blobClient = blobContainerClient.getBlobClient( "processed-" + input.getItemId() + ".json");
